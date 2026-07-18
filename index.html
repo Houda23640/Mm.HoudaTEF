@@ -939,6 +939,7 @@ footer { background: var(--surface2); border-top: 1px solid var(--border); paddi
       <button class="admin-btn" onclick="qbExportBank()">⬇️ Exporter la banque</button>
       <label class="admin-btn" style="cursor:pointer;">⬆️ Importer une banque<input type="file" accept=".json" style="display:none;" onchange="qbImportBank(this)"></label>
       <button class="admin-btn success" onclick="qbBulkAdd30()">⚡ إضافة 30 سؤال دفعة واحدة</button>
+      <button class="admin-btn" onclick="qbClearLocalCache()" title="يحرر مساحة في المتصفح فقط، لا يحذف أي سؤال حقيقي من الخادم">🧹 تفريغ التخزين المؤقت للمتصفح</button>
       <button class="admin-btn danger" onclick="qbClearAll()">🗑️ Tout effacer</button>
     </div>
 
@@ -2286,7 +2287,7 @@ async function loadSharedFirebaseData() {
   for (const section of ['co','ce','sl','ee','eo']) {
     try {
       const fbData = await window.fbLoad('tef/qbank/' + section, null);
-      if (fbData) localStorage.setItem(QB_KEYS[section], JSON.stringify(fbData));
+      if (fbData) qbSetCache(section, fbData);
     } catch(e){}
   }
   qbLoadAllIntoLiveBanks();
@@ -2868,17 +2869,18 @@ function openPurchaseModal(packId, packName) {
 function previewReceipt(input) {
   const file = input.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
+  compressImageFile(file, 900, 0.72).then(compressed => {
     const prev = document.getElementById('receiptPreview');
-    prev.src = e.target.result; prev.style.display = 'block';
+    prev.src = compressed; prev.style.display = 'block';
     if (currentUser) {
       const users = getUsers();
       const idx = users.findIndex(u => u.id === currentUser.id);
-      if (idx !== -1) { users[idx].receipt = e.target.result; saveUsers(users); }
+      if (idx !== -1) { users[idx].receipt = compressed; saveUsers(users); }
     }
-  };
-  reader.readAsDataURL(file);
+  }).catch(e => {
+    console.error('previewReceipt compress failed:', e);
+    alert('⚠️ تعذّرت معالجة صورة الإيصال. جرّبي صورة أخرى.');
+  });
 }
 function sendReceipt() {
   alert('✅ تم إرسال طلبك! ستتواصل معك Mme H.Ouadfel عبر WhatsApp قريباً.\n\nلا تنسي إرسال الإيصال على WhatsApp: 0563 090 449');
@@ -2937,9 +2939,9 @@ function submitRecu() {
       users[idx].receiptForm = { nom, tel, email, ville: document.getElementById('recu-ville').value.trim(), pack, mode, montant, submittedAt: new Date().toLocaleDateString('fr-FR') };
       const fileEl = document.getElementById('recu-file');
       if (fileEl && fileEl.files[0]) {
-        const reader = new FileReader();
-        reader.onload = e => { users[idx].receipt = e.target.result; saveUsers(users); };
-        reader.readAsDataURL(fileEl.files[0]);
+        compressImageFile(fileEl.files[0], 900, 0.72)
+          .then(compressed => { users[idx].receipt = compressed; saveUsers(users); })
+          .catch(e => { console.error('submitRecu compress failed:', e); saveUsers(users); });
       } else saveUsers(users);
     }
   }
@@ -3135,24 +3137,29 @@ function previewImg(src) { document.getElementById('imgPreviewSrc').src = src; o
 // BANQUE DE QUESTIONS ADMIN — généralisée à 4 examens TEF
 // (au lieu de 2 variantes Canada/SODAP comme dans l'ancien moteur)
 // ══════════════════════════════════════════
+// كاش احتياطي في الذاكرة: يبقى دائماً محدّثاً حتى لو امتلأ التخزين المحلي (localStorage) في المتصفح.
+// Firebase يبقى دائماً "مصدر الحقيقة" المشترك — هذا الكاش فقط لتسريع العرض ولا يُشترط نجاحه لحفظ أي شيء.
+const QB_MEM = {};
 function qbGet(section) {
+  if (QB_MEM[section] !== undefined) return QB_MEM[section];
   try { return JSON.parse(localStorage.getItem(QB_KEYS[section]) || '[]'); }
   catch(e) { return []; }
 }
+function qbSetCache(section, arr) {
+  QB_MEM[section] = arr;
+  try { localStorage.setItem(QB_KEYS[section], JSON.stringify(arr)); }
+  catch(e) { console.warn('qbSetCache: التخزين المحلي ممتلئ لـ "' + section + '"، سيُستعمل كاش الذاكرة لهذه الجلسة (لا يمنع الحفظ الحقيقي على Firebase).', e); }
+}
 async function qbSave(section, arr) {
-  try {
-    localStorage.setItem(QB_KEYS[section], JSON.stringify(arr));
-  } catch(e) {
-    console.error('qbSave localStorage failed:', section, e);
-    alert('❌ فشل حفظ الأسئلة! لم تتم إضافة أي شيء.\n\nالسبب الأغلب: مساحة التخزين في المتصفح ممتلئة (غالباً بسبب صور أو تسجيلات صوتية كبيرة الحجم مرفقة بأسئلة سابقة).\n\n💡 جرّبي حذف بعض الأسئلة القديمة التي فيها ملفات مرفقة كبيرة، أو استعملي ملفات أصغر حجماً، ثم أعيدي المحاولة.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e));
-    return false;
-  }
+  // نحدّث الكاش (ذاكرة + localStorage قدر الإمكان) — لكن امتلاء التخزين المحلي لم يعد يوقف الحفظ الحقيقي أبداً
+  qbSetCache(section, arr);
   if (window.firebaseReady && window.fbSave) {
     try {
       await window.fbSave('tef/qbank/' + section, arr);
     } catch(e) {
       console.error('qbSave fbSave failed:', section, e);
       alert('❌ فشل حفظ الأسئلة على الخادم (Firebase)!\nالأسئلة ظهرت عندك محلياً فقط ولن تصل للطلاب حتى تُصلَح المشكلة.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e) + '\n\n💡 السبب الأغلب: قواعد الأمان (Rules) في Firebase Console تمنع الكتابة (منتهية الصلاحية أو غير صحيحة).');
+      return false;
     }
   }
   return true;
@@ -3162,7 +3169,7 @@ function qbWatchFirebase() {
     if (window.fbWatch) {
       window.fbWatch('tef/qbank/' + section, (data) => {
         if (data) {
-          localStorage.setItem(QB_KEYS[section], JSON.stringify(data));
+          qbSetCache(section, data);
           qbLoadAllIntoLiveBanks();
           if (isAdmin) { qbRenderList(section); qbUpdateCounts(); }
         }
@@ -3182,17 +3189,32 @@ function qbShowTab(tab) {
   if (tab === 'final') { qbFinalOnExamTypeChange(); qbFinalRenderTable(); }
   else qbRenderList(tab);
 }
-function qbHandleFile(section, input) {
+async function qbHandleFile(section, input) {
   const file = input.files[0];
   if (!file) return;
-  const reader = new FileReader();
   const previewEl = document.getElementById(section + '-file-preview');
+  // الصور تُضغط تلقائياً (أبعاد قصوى 1280px وجودة 75%) — هذا يقلّص حجمها كثيراً
+  // ويحمي من امتلاء التخزين المحلي مستقبلاً، ويسرّع وصولها للطلاب عبر Firebase.
+  if (file.type.startsWith('image/')) {
+    try {
+      const compressed = await compressImageFile(file, 1280, 0.75);
+      input._dataUri = compressed; input._fileName = file.name; input._fileType = 'image/jpeg';
+      if (previewEl) previewEl.innerHTML = `<img src="${compressed}" style="max-width:200px;max-height:140px;border-radius:8px;border:2px solid var(--accent);margin-top:.4rem;">`;
+    } catch(e) {
+      console.error('qbHandleFile compress failed:', e);
+      alert('⚠️ تعذّر ضغط الصورة. جرّبي صورة أخرى.');
+    }
+    return;
+  }
+  if (file.type.startsWith('audio/') && file.size > 6 * 1024 * 1024) {
+    alert('⚠️ هذا الملف الصوتي كبير الحجم (' + (file.size/1024/1024).toFixed(1) + ' ميغابايت).\nيُفضّل استعمال تسجيل أقصر أو أخف حجماً لتفادي امتلاء التخزين مستقبلاً.\nسيُحفظ الملف كما هو الآن.');
+  }
+  const reader = new FileReader();
   reader.onload = e => {
     const data = e.target.result;
     input._dataUri = data; input._fileName = file.name; input._fileType = file.type;
     if (!previewEl) return;
-    if (file.type.startsWith('image/')) previewEl.innerHTML = `<img src="${data}" style="max-width:200px;max-height:140px;border-radius:8px;border:2px solid var(--accent);margin-top:.4rem;">`;
-    else if (file.type.startsWith('audio/')) previewEl.innerHTML = `<audio controls style="margin-top:.4rem;width:100%;"><source src="${data}" type="${file.type}"></audio>`;
+    if (file.type.startsWith('audio/')) previewEl.innerHTML = `<audio controls style="margin-top:.4rem;width:100%;"><source src="${data}" type="${file.type}"></audio>`;
     else previewEl.innerHTML = `<div style="padding:.5rem;background:var(--surface2);border-radius:6px;font-size:.82rem;color:var(--gold);">📄 ${file.name}</div>`;
   };
   reader.readAsDataURL(file);
@@ -3998,6 +4020,12 @@ function qbUpdateCounts() {
       if (el) el.textContent = n;
     });
   });
+}
+function qbClearLocalCache() {
+  if (!confirm('سيتم فقط تفريغ نسخة "الكاش" المحفوظة في هذا المتصفح لتحرير مساحة التخزين.\n\nالأسئلة نفسها محفوظة بأمان على الخادم (Firebase) ولن تُحذف نهائياً، وستُعاد جميعها تلقائياً بعد إعادة تحميل الصفحة.\n\nمتابعة؟')) return;
+  Object.values(QB_KEYS).forEach(k => { try { localStorage.removeItem(k); } catch(e){} });
+  alert('✅ تم تفريغ التخزين المؤقت. سيُعاد تحميل الصفحة الآن لجلب كل الأسئلة من جديد من الخادم.');
+  location.reload();
 }
 async function qbClearAll() {
   if (!confirm('⚠️ سيتم مسح جميع أسئلة الإدارة المضافة. هل أنت متأكد؟')) return;
