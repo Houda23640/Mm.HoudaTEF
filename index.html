@@ -447,6 +447,9 @@ footer { background: var(--surface2); border-top: 1px solid var(--border); paddi
   import {
     getDatabase, ref, set, get, onValue, remove, off
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+  import {
+    getStorage, ref as storageRef, uploadBytesResumable, getDownloadURL, deleteObject
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 
   // Your web app's Firebase configuration
   const firebaseConfig = {
@@ -466,12 +469,38 @@ footer { background: var(--surface2); border-top: 1px solid var(--border); paddi
   try { analytics = getAnalytics(app); } catch(e) { /* analytics indisponible (ex: bloqueur de pub) — non bloquant */ }
   const auth = getAuth(app);
   const db = getDatabase(app);
+  const storage = getStorage(app); // غير مُستعمل حالياً عمداً (Firebase Storage يتطلب خطة Blaze المدفوعة) — أُبقي عليه جاهزاً في حال رُقّي المشروع مستقبلاً
 
   // ── Pont générique window.fb* utilisé par tout le moteur applicatif (app.js) ──
   window.firebaseReady = false;
 
   window.fbSave = (path, value) => set(ref(db, path), value);
   window.fbDelete = (path) => remove(ref(db, path));
+
+  // ── معالجة ملف كبير (صوت/صورة) — بدون Firebase Storage ──
+  // ⚠️ ملاحظة مهمة (تغيّر منذ فبراير 2026): Firebase Storage لم يعد متاحاً إطلاقاً على الخطة
+  // المجانية (Spark) — أصبح يتطلب ترقية المشروع إلى خطة Blaze (تتطلب بطاقة بنكية) حتى لو لم
+  // يتجاوز الاستعمال الحصة المجانية. لتفادي إجبار المستخدمة على الدفع، تحوّلنا لحل مجاني بالكامل:
+  // كل ملف يُحوَّل هنا إلى نص base64 (data URI) مباشرة في المتصفح، ثم يُخزَّن هذا النص كجزء من
+  // بيانات السؤال/العنصر نفسه في Firebase Realtime Database (مجاني حتى 1 غيغا — راجع fbSave أعلاه)
+  // بدل تخزينه في Storage. النتيجة تعمل بنفس الطريقة تماماً (رابط src صالح للصور والصوت)، لكن
+  // بدون أي حاجة لخطة مدفوعة. الضغط المسبق للصور (compressImageForUpload) وحد حجم الصوت
+  // (قسم qbHandleFile) يبقيان الحجم معقولاً كي لا تمتلئ حصة قاعدة البيانات المجانية بسرعة.
+  window.fbUploadFile = (path, fileOrBlob, onProgress) => {
+    return new Promise((resolve, reject) => {
+      try {
+        const reader = new FileReader();
+        reader.onprogress = (e) => { if (onProgress && e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 95)); };
+        reader.onload = () => { if (onProgress) onProgress(100); resolve(reader.result); };
+        reader.onerror = () => reject(new Error('تعذّرت قراءة الملف في المتصفح'));
+        reader.readAsDataURL(fileOrBlob);
+      } catch (e) { reject(e); }
+    });
+  };
+  // لم يعد هناك ملف منفصل مخزَّن في Storage لحذفه — البيانات (data URI) جزء من السجل نفسه في
+  // قاعدة البيانات وتُستبدَل تلقائياً عند تعديل/حذف ذلك السجل. نُبقي الدالة كواجهة فارغة آمنة
+  // حتى لا تنكسر بقية الكود الذي ينادي عليها (مثلاً عند حذف سؤال أو استبدال إيصال قديم).
+  window.fbDeleteFile = async (path) => {};
 
   // fbLoad : lecture "silencieuse" — retourne la valeur par défaut si erreur (utilisée pour données publiques)
   window.fbLoad = async (path, def) => {
@@ -908,7 +937,7 @@ footer { background: var(--surface2); border-top: 1px solid var(--border); paddi
     <input type="file" id="storyImgInput" accept="image/*" onchange="previewStoryImg(this)" style="margin-bottom:.5rem;">
     <img id="storyImgPreview" style="display:none;max-width:160px;border-radius:8px;margin-bottom:.8rem;">
     <div style="display:flex;gap:.6rem;flex-wrap:wrap;">
-      <button class="admin-btn success" onclick="adminAddStory()">➕ Ajouter la story</button>
+      <button id="storyAddBtn" class="admin-btn success" onclick="adminAddStory()">➕ Ajouter la story</button>
       <button class="admin-btn danger" onclick="adminClearStories()">🗑️ Tout effacer</button>
     </div>
     <div id="adminStoriesList" style="display:flex;gap:.7rem;flex-wrap:wrap;margin-top:1rem;"></div>
@@ -1279,7 +1308,7 @@ footer { background: var(--surface2); border-top: 1px solid var(--border); paddi
     </div>
     <input type="file" id="recu-file" accept="image/*" onchange="previewRecuFile(this)">
     <img id="recu-preview" style="display:none;max-width:200px;border-radius:8px;margin:.8rem 0;">
-    <button class="btn-primary" onclick="submitRecu()">✅ Envoyer ma demande d'activation</button>
+    <button id="recuSubmitBtn" class="btn-primary" onclick="submitRecu()">✅ Envoyer ma demande d'activation</button>
     <div id="recu-summary-wrap" style="display:none;margin-top:1.5rem;">
       <table class="admin-table"><tbody id="recu-summary-table"></tbody></table>
     </div>
@@ -2751,15 +2780,20 @@ function closeStoryViewer() { document.getElementById('storyViewer').classList.r
 function previewStoryImg(input) {
   const file = input.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => { const prev = document.getElementById('storyImgPreview'); prev.src = e.target.result; prev.style.display = 'block'; };
-  reader.readAsDataURL(file);
+  // نُنشئ Blob URL مؤقتاً للمعاينة فقط — لا base64 هنا.
+  // الملف الحقيقي يُضغَط ويُحوَّل إلى data URI في adminAddStory عند الضغط على "إضافة".
+  if (input._previewUrl) { try { URL.revokeObjectURL(input._previewUrl); } catch(e){} }
+  const url = URL.createObjectURL(file);
+  input._previewUrl = url; input._file = file;
+  const prev = document.getElementById('storyImgPreview');
+  prev.src = url; prev.style.display = 'block';
 }
 
 // ──────────────────────────────────────────
 // PHOTO DE LA FONDATRICE
 // ──────────────────────────────────────────
 function renderFounderPhoto() {
+  // tef_founder_photo: صورة مضغوطة مخزَّنة كـ data URI داخل Firebase Realtime Database (مجاني)
   const photo = loadData('tef_founder_photo', null);
   const wrap = document.getElementById('founderPhotoWrap');
   if (photo && wrap) wrap.innerHTML = `<img src="${photo}" class="founder-photo" alt="Mme H. Ouadfel">`;
@@ -2785,22 +2819,52 @@ function compressImageFile(file, maxDim, quality) {
     reader.readAsDataURL(file);
   });
 }
+// نفس منطق ضغط الصور، لكن يُرجع أيضاً Blob حقيقياً (أخف من نص base64 أثناء المعالجة في المتصفح)
+// يُمرَّر بعدها إلى fbUploadFile الذي يحوّله إلى data URI مضغوط قبل حفظه في قاعدة البيانات.
+function compressImageForUpload(file, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = Math.round(height * maxDim / width); width = maxDim; }
+        else if (height > maxDim) { width = Math.round(width * maxDim / height); height = maxDim; }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        canvas.toBlob(blob => {
+          if (!blob) { reject(new Error('toBlob a échoué')); return; }
+          resolve({ dataUri: canvas.toDataURL('image/jpeg', quality), blob });
+        }, 'image/jpeg', quality);
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 async function uploadFounderPhoto(input) {
   const file = input.files[0];
   if (!file) return;
+  const uploadBtn = input.closest && input.closest('label');
   try {
-    const compressed = await compressImageFile(file, 600, 0.75);
-    renderFounderPhotoPreviewOnly(compressed);
-    await saveDataSync('tef_founder_photo', compressed);
+    // ضغط الصورة أولاً (600px، 75%) ثم تحويلها إلى data URI مضغوط يُخزَّن مباشرة في قاعدة البيانات
+    const { dataUri, blob } = await compressImageForUpload(file, 600, 0.75);
+    renderFounderPhotoPreviewOnly(dataUri);
+    const path = 'founder/photo.jpg';
+    const url = await window.fbUploadFile(path, blob);
+    await saveDataSync('tef_founder_photo', url);
     renderFounderPhoto();
     alert('✅ تم حفظ الصورة وستظهر الآن لجميع الطلاب على كل الأجهزة.');
   } catch(e) {
-    alert('⚠️ فشل حفظ الصورة على الخادم (Firebase)!\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e));
+    alert('⚠️ فشل حفظ صورة المؤسِّسة!\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e) + '\n\n💡 تأكدي من اتصال الإنترنت، ومن أن الصورة ليست ضخمة جداً.');
   } finally { input.value = ''; }
 }
-function renderFounderPhotoPreviewOnly(dataUrl) {
+function renderFounderPhotoPreviewOnly(dataUrlOrUrl) {
   const prev = document.getElementById('adminPhotoPreview');
-  if (prev) { prev.src = dataUrl; prev.classList.remove('hidden'); }
+  if (prev) { prev.src = dataUrlOrUrl; prev.classList.remove('hidden'); }
 }
 async function saveDataSync(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch(e){}
@@ -2869,18 +2933,12 @@ function openPurchaseModal(packId, packName) {
 function previewReceipt(input) {
   const file = input.files[0];
   if (!file) return;
-  compressImageFile(file, 900, 0.72).then(compressed => {
-    const prev = document.getElementById('receiptPreview');
-    prev.src = compressed; prev.style.display = 'block';
-    if (currentUser) {
-      const users = getUsers();
-      const idx = users.findIndex(u => u.id === currentUser.id);
-      if (idx !== -1) { users[idx].receipt = compressed; saveUsers(users); }
-    }
-  }).catch(e => {
-    console.error('previewReceipt compress failed:', e);
-    alert('⚠️ تعذّرت معالجة صورة الإيصال. جرّبي صورة أخرى.');
-  });
+  // معاينة فقط بـ Blob URL — لا base64، الرفع يحدث لاحقاً عند sendReceipt/submitRecu
+  if (input._previewUrl) { try { URL.revokeObjectURL(input._previewUrl); } catch(e){} }
+  const url = URL.createObjectURL(file);
+  input._previewUrl = url; input._file = file;
+  const prev = document.getElementById('receiptPreview');
+  if (prev) { prev.src = url; prev.style.display = 'block'; }
 }
 function sendReceipt() {
   alert('✅ تم إرسال طلبك! ستتواصل معك Mme H.Ouadfel عبر WhatsApp قريباً.\n\nلا تنسي إرسال الإيصال على WhatsApp: 0563 090 449');
@@ -2893,12 +2951,12 @@ function sendReceipt() {
 function previewRecuFile(input) {
   const file = input.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
-    const prev = document.getElementById('recu-preview');
-    if (file.type.startsWith('image/')) { prev.src = e.target.result; prev.style.display = 'block'; }
-  };
-  reader.readAsDataURL(file);
+  // Blob URL للمعاينة فقط — الرفع يحدث في submitRecu عند الإرسال
+  if (input._previewUrl) { try { URL.revokeObjectURL(input._previewUrl); } catch(e){} }
+  const url = URL.createObjectURL(file);
+  input._previewUrl = url; input._file = file;
+  const prev = document.getElementById('recu-preview');
+  if (file.type.startsWith('image/') && prev) { prev.src = url; prev.style.display = 'block'; }
   updateRecuSummary();
 }
 function updateRecuSummary() {
@@ -2924,32 +2982,54 @@ function updateRecuSummary() {
     </tr>`).join('');
   wrap.style.display = 'block';
 }
-function submitRecu() {
+async function submitRecu() {
   const nom = document.getElementById('recu-nom').value.trim();
   const tel = document.getElementById('recu-tel').value.trim();
   const email = document.getElementById('recu-email').value.trim();
+  const ville = document.getElementById('recu-ville').value.trim();
   const pack = document.getElementById('recu-pack').value;
   const mode = document.getElementById('recu-mode').value;
   const montant = document.getElementById('recu-montant').value;
   if (!nom || !tel || !email || !pack || !mode || !montant) { alert('⚠️ يرجى ملء جميع الحقول الإلزامية (*)'); return; }
-  if (currentUser) {
-    const users = getUsers();
-    const idx = users.findIndex(u => u.id === currentUser.id);
-    if (idx !== -1) {
-      users[idx].receiptForm = { nom, tel, email, ville: document.getElementById('recu-ville').value.trim(), pack, mode, montant, submittedAt: new Date().toLocaleDateString('fr-FR') };
-      const fileEl = document.getElementById('recu-file');
-      if (fileEl && fileEl.files[0]) {
-        compressImageFile(fileEl.files[0], 900, 0.72)
-          .then(compressed => { users[idx].receipt = compressed; saveUsers(users); })
-          .catch(e => { console.error('submitRecu compress failed:', e); saveUsers(users); });
-      } else saveUsers(users);
+  const submitBtn = document.getElementById('recuSubmitBtn');
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = '⏳ جارِ الإرسال...'; }
+  try {
+    if (currentUser) {
+      const users = getUsers();
+      const idx = users.findIndex(u => u.id === currentUser.id);
+      if (idx !== -1) {
+        users[idx].receiptForm = { nom, tel, email, ville, pack, mode, montant, submittedAt: new Date().toLocaleDateString('fr-FR') };
+        const fileEl = document.getElementById('recu-file');
+        if (fileEl && fileEl._file) {
+          try {
+            if (submitBtn) submitBtn.textContent = '⏳ جارِ رفع الإيصال...';
+            const { blob } = await compressImageForUpload(fileEl._file, 900, 0.72);
+            const userId = currentUser.id || ('u' + Date.now());
+            const path = 'receipts/' + userId + '_' + Date.now() + '.jpg';
+            const url = await window.fbUploadFile(path, blob, (pct) => {
+              if (submitBtn) submitBtn.textContent = `⏳ جارِ رفع الإيصال... ${pct}%`;
+            });
+            // الصورة (مضغوطة) تُحفَظ كـ data URI داخل بيانات المستخدم نفسها في قاعدة البيانات
+            if (users[idx].receiptPath) window.fbDeleteFile(users[idx].receiptPath); // لا حاجة فعلية الآن، تبقى للتوافق
+            users[idx].receipt = url; users[idx].receiptPath = path;
+            if (fileEl._previewUrl) { try { URL.revokeObjectURL(fileEl._previewUrl); } catch(e){} }
+            fileEl._file = null; fileEl._previewUrl = null;
+          } catch(e) {
+            console.error('submitRecu upload failed:', e);
+            // لا نوقف العملية كاملاً — نتابع بدون صورة ونُنبّه
+            alert('⚠️ تعذّر رفع صورة الإيصال (لكن بيانات نموذجك ستُحفظ).\n\nأرسلي الإيصال يدوياً على WhatsApp.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e));
+          }
+        }
+        saveUsers(users);
+      }
     }
+    updateRecuSummary();
+    const msg = `Bonjour Mme H.Ouadfel 👋\n\nDemande d'activation VIP – TEF :\n👤 Nom: ${nom}\n📞 Tél: ${tel}\n📧 Email: ${email}\n🏙️ Ville: ${ville||'N/A'}\n📦 Pack: ${pack}\n💳 Paiement: ${mode}\n💰 Montant: ${montant} DA\n\nMerci de bien vouloir activer mon compte.`;
+    alert('✅ تم حفظ بياناتك! سيتم تحويلك إلى WhatsApp لإرسال الوصل.\n\nبعد الإرسال، ستتواصل معك Mme H.Ouadfel لتفعيل حسابك.');
+    window.open('https://wa.me/213563090449?text=' + encodeURIComponent(msg), '_blank');
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'إرسال الطلب ✈️'; }
   }
-  updateRecuSummary();
-  const ville = document.getElementById('recu-ville').value.trim();
-  const msg = `Bonjour Mme H.Ouadfel 👋\n\nDemande d'activation VIP – TEF :\n👤 Nom: ${nom}\n📞 Tél: ${tel}\n📧 Email: ${email}\n🏙️ Ville: ${ville||'N/A'}\n📦 Pack: ${pack}\n💳 Paiement: ${mode}\n💰 Montant: ${montant} DA\n\nMerci de bien vouloir activer mon compte.`;
-  alert('✅ تم حفظ بياناتك! سيتم تحويلك إلى WhatsApp لإرسال الوصل.\n\nبعد الإرسال، ستتواصل معك Mme H.Ouadfel لتفعيل حسابك.');
-  window.open('https://wa.me/213563090449?text=' + encodeURIComponent(msg), '_blank');
 }
 // ──────────────────────────────────────────
 // PANNEAU ADMIN
@@ -3093,19 +3173,39 @@ function renderAdminStories() {
       <button class="admin-btn danger small" style="margin-top:.35rem;width:100%;font-size:.68rem;padding:.25rem;" onclick="adminDeleteStory(${i})">🗑️ حذف</button>
     </div>`).join('');
 }
-function adminAddStory() {
+async function adminAddStory() {
   const label = document.getElementById('storyLabel').value.trim();
   const type = document.getElementById('storyType').value;
   const prevEl = document.getElementById('storyImgPreview');
+  const storyInput = document.getElementById('storyImgInput');
+  const addBtn = document.getElementById('storyAddBtn');
   if (!prevEl.src || prevEl.style.display === 'none') { alert('الرجاء اختيار صورة للستوري'); return; }
-  const stories = getStories();
-  stories.push({ label, type, img: prevEl.src, createdAt: Date.now() });
-  saveStories(stories);
-  document.getElementById('storyLabel').value = '';
-  prevEl.style.display = 'none'; prevEl.src = '';
-  document.getElementById('storyImgInput').value = '';
-  renderAdminStories(); renderStoriesBar();
-  alert('✅ تمت إضافة الستوري! تظهر الآن للطلاب فوراً.');
+  if (!storyInput._file) { alert('الرجاء اختيار صورة للستوري'); return; }
+  // ضغط الصورة وتحويلها إلى data URI يُخزَّن مباشرة في قاعدة البيانات (مجاني، بدون Storage)
+  if (addBtn) addBtn.disabled = true;
+  const origBtnText = addBtn ? addBtn.textContent : '';
+  if (addBtn) addBtn.textContent = '⏳ جارِ رفع الصورة...';
+  try {
+    const { blob } = await compressImageForUpload(storyInput._file, 1080, 0.80);
+    const safeName = ('story_' + Date.now() + '.jpg');
+    const url = await window.fbUploadFile('stories/' + safeName, blob, (pct) => {
+      if (addBtn) addBtn.textContent = `⏳ جارِ رفع الصورة... ${pct}%`;
+    });
+    const stories = getStories();
+    stories.push({ label, type, img: url, filePath: 'stories/' + safeName, createdAt: Date.now() });
+    saveStories(stories);
+    document.getElementById('storyLabel').value = '';
+    prevEl.style.display = 'none'; prevEl.src = '';
+    if (storyInput._previewUrl) { try { URL.revokeObjectURL(storyInput._previewUrl); } catch(e){} }
+    storyInput.value = ''; storyInput._file = null; storyInput._previewUrl = null;
+    renderAdminStories(); renderStoriesBar();
+    alert('✅ تمت إضافة الستوري! تظهر الآن للطلاب فوراً.');
+  } catch(e) {
+    console.error('adminAddStory upload failed:', e);
+    alert('❌ فشل رفع صورة الستوري!\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e) + '\n\n💡 تأكدي من اتصال الإنترنت، ومن أن قواعد الأمان (Rules) في Firebase تسمح بالكتابة.');
+  } finally {
+    if (addBtn) { addBtn.disabled = false; addBtn.textContent = origBtnText; }
+  }
 }
 function adminDeleteStory(idx) {
   const stories = getStories();
@@ -3113,10 +3213,13 @@ function adminDeleteStory(idx) {
   if (!confirm(`⚠️ حذف هذه الستوري${s && s.label ? ' ("'+s.label+'")' : ''} ؟`)) return;
   stories.splice(idx, 1);
   saveStories(stories);
+  if (s && s.filePath) window.fbDeleteFile(s.filePath); // تنظيف الصورة من Storage
   renderAdminStories(); renderStoriesBar();
 }
 function adminClearStories() {
   if (!confirm('⚠️ حذف جميع الستوريات؟')) return;
+  const stories = getStories();
+  stories.forEach(s => { if (s.filePath) window.fbDeleteFile(s.filePath); }); // تنظيف كل الصور من Storage
   saveStories([]);
   renderAdminStories(); renderStoriesBar();
 }
@@ -3127,10 +3230,21 @@ function renderAdminReceipts() {
   if (!users.length) { el.innerHTML = '<p style="color:var(--text-muted);font-size:.85rem;">لا توجد إيصالات مرفوعة بعد</p>'; return; }
   el.innerHTML = users.map(u => `
     <div style="text-align:center;">
-      <img src="${u.receipt}" class="receipt-thumb" onclick="previewImg('${u.receipt}')" style="width:70px;height:70px;">
+      <img src="${u.receipt}" class="receipt-thumb" onclick="previewImg('${u.receipt}')" style="width:70px;height:70px;object-fit:cover;cursor:pointer;border-radius:6px;">
       <div style="font-size:.72rem;color:var(--text-muted);margin-top:.3rem;">${u.name}</div>
       <button class="admin-btn success small" style="margin-top:.3rem;" onclick="adminActivateVIP('${u.id}')">تفعيل VIP</button>
+      <button class="admin-btn danger small" style="margin-top:.3rem;" onclick="adminDeleteReceipt('${u.id}')">🗑️ حذف</button>
     </div>`).join('');
+}
+async function adminDeleteReceipt(userId) {
+  if (!confirm('حذف إيصال هذا المستخدم؟')) return;
+  const users = getUsers();
+  const idx = users.findIndex(u => u.id === userId);
+  if (idx === -1) return;
+  if (users[idx].receiptPath) window.fbDeleteFile(users[idx].receiptPath);
+  delete users[idx].receipt; delete users[idx].receiptPath;
+  saveUsers(users);
+  renderAdminReceipts();
 }
 function previewImg(src) { document.getElementById('imgPreviewSrc').src = src; openModal('imgPreviewModal'); }
 // ══════════════════════════════════════════
@@ -3146,9 +3260,23 @@ function qbGet(section) {
   catch(e) { return []; }
 }
 function qbSetCache(section, arr) {
-  QB_MEM[section] = arr;
-  try { localStorage.setItem(QB_KEYS[section], JSON.stringify(arr)); }
-  catch(e) { console.warn('qbSetCache: التخزين المحلي ممتلئ لـ "' + section + '"، سيُستعمل كاش الذاكرة لهذه الجلسة (لا يمنع الحفظ الحقيقي على Firebase).', e); }
+  QB_MEM[section] = arr; // المصدر الكامل والدقيق لهذه الجلسة (يشمل الملفات fileUri) — لا يتأثر أبداً بحالة localStorage
+  try {
+    localStorage.setItem(QB_KEYS[section], JSON.stringify(arr));
+    return;
+  } catch(e) {
+    console.warn('qbSetCache: التخزين المحلي ممتلئ لـ "' + section + '" — نجرّب نسخة أخف بدون الملفات المرفقة...', e);
+  }
+  // محاولة ثانية عند امتلاء الحصة: نفس الأسئلة لكن بدون حقل fileUri (الصور/التسجيلات الصوتية
+  // بصيغة base64 — وهي غالباً المسؤولة عن امتلاء حصة localStorage الصغيرة أصلاً، عادة 5-10 ميغا فقط).
+  // هكذا يبقى عندنا كاش نصي صالح لأوّل تحميل قادم للصفحة (قبل وصول بيانات Firebase)، بينما الملفات
+  // نفسها تبقى محفوظة بأمان تام في QB_MEM لهذه الجلسة، وبشكل دائم على Firebase (مصدر الحقيقة الحقيقي).
+  try {
+    const light = arr.map(({ fileUri, ...rest }) => rest);
+    localStorage.setItem(QB_KEYS[section], JSON.stringify(light));
+  } catch(e2) {
+    console.warn('qbSetCache: تعذّر حتى تخزين النسخة الخفيفة لـ "' + section + '" — سيُعتمد على كاش الذاكرة فقط لهذه الجلسة (لا يمنع الحفظ الحقيقي على Firebase).', e2);
+  }
 }
 async function qbSave(section, arr) {
   // نحدّث الكاش (ذاكرة + localStorage قدر الإمكان) — لكن امتلاء التخزين المحلي لم يعد يوقف الحفظ الحقيقي أبداً
@@ -3158,7 +3286,7 @@ async function qbSave(section, arr) {
       await window.fbSave('tef/qbank/' + section, arr);
     } catch(e) {
       console.error('qbSave fbSave failed:', section, e);
-      alert('❌ فشل حفظ الأسئلة على الخادم (Firebase)!\nالأسئلة ظهرت عندك محلياً فقط ولن تصل للطلاب حتى تُصلَح المشكلة.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e) + '\n\n💡 السبب الأغلب: قواعد الأمان (Rules) في Firebase Console تمنع الكتابة (منتهية الصلاحية أو غير صحيحة).');
+      alert('❌ فشل حفظ الأسئلة على الخادم (Firebase)!\nالأسئلة ظهرت عندك محلياً فقط ولن تصل للطلاب حتى تُصلَح المشكلة.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e) + '\n\n💡 الأسباب المحتملة: 1) قواعد الأمان (Rules) في Firebase Console تمنع الكتابة (منتهية الصلاحية أو غير صحيحة)، أو 2) اتصال الإنترنت انقطع أثناء الحفظ، أو 3) (نادراً) تراكم عدد كبير من الملفات المرفقة في هذا القسم جعل حجم البيانات كبيراً جداً — إن استمرت المشكلة رغم اتصال سليم وقواعد صحيحة، احذفي أقدم سؤال فيه ملف مرفق كبير من هذا القسم ثم أعيدي المحاولة.');
       return false;
     }
   }
@@ -3193,31 +3321,50 @@ async function qbHandleFile(section, input) {
   const file = input.files[0];
   if (!file) return;
   const previewEl = document.getElementById(section + '-file-preview');
-  // الصور تُضغط تلقائياً (أبعاد قصوى 1280px وجودة 75%) — هذا يقلّص حجمها كثيراً
-  // ويحمي من امتلاء التخزين المحلي مستقبلاً، ويسرّع وصولها للطلاب عبر Firebase.
+
+  // ننظّف أي معاينة سابقة (Blob URL) قبل معالجة ملف جديد، لتفادي تسرّب الذاكرة
+  if (input._previewUrl) { try { URL.revokeObjectURL(input._previewUrl); } catch(e){} }
+  input._file = null; input._dataUri = null; input._fileName = null; input._fileType = null; input._previewUrl = null;
+
+  // ── ملاحظة معمارية مهمة ──
+  // الملف الحقيقي (input._file) لا يُخزَّن أبداً كـ base64 في localStorage مباشرة أثناء الاختيار.
+  // عند الضغط على "Ajouter la question"، يُضغَط الملف (للصور) ثم يُحوَّل إلى data URI ويُخزَّن
+  // كجزء من السؤال في Firebase Realtime Database (مجاني — لا حاجة لـ Firebase Storage المدفوع).
+  // هذا يمنع امتلاء حصة المتصفح (localStorage) لأن qbSetCache تتجاهل هذا الحقل تلقائياً من الكاش
+  // المحلي عند الحاجة، بينما البيانات الحقيقية تبقى دائماً بأمان على Firebase (مصدر الحقيقة).
+
+  // الصور تُضغط تلقائياً (أبعاد قصوى 1280px وجودة 75%) — يقلّص حجمها كثيراً ويسرّع رفعها ووصولها للطلاب.
   if (file.type.startsWith('image/')) {
     try {
-      const compressed = await compressImageFile(file, 1280, 0.75);
-      input._dataUri = compressed; input._fileName = file.name; input._fileType = 'image/jpeg';
-      if (previewEl) previewEl.innerHTML = `<img src="${compressed}" style="max-width:200px;max-height:140px;border-radius:8px;border:2px solid var(--accent);margin-top:.4rem;">`;
+      const { dataUri, blob } = await compressImageForUpload(file, 1280, 0.75);
+      input._file = blob; input._fileName = file.name; input._fileType = 'image/jpeg';
+      if (previewEl) previewEl.innerHTML = `<img src="${dataUri}" style="max-width:200px;max-height:140px;border-radius:8px;border:2px solid var(--accent);margin-top:.4rem;">`;
     } catch(e) {
       console.error('qbHandleFile compress failed:', e);
       alert('⚠️ تعذّر ضغط الصورة. جرّبي صورة أخرى.');
     }
     return;
   }
-  if (file.type.startsWith('audio/') && file.size > 6 * 1024 * 1024) {
-    alert('⚠️ هذا الملف الصوتي كبير الحجم (' + (file.size/1024/1024).toFixed(1) + ' ميغابايت).\nيُفضّل استعمال تسجيل أقصر أو أخف حجماً لتفادي امتلاء التخزين مستقبلاً.\nسيُحفظ الملف كما هو الآن.');
+
+  // الملفات الصوتية: بما أنها الآن تُخزَّن مباشرة (كـ base64) في قاعدة البيانات المجانية بدل
+  // خدمة تخزين مدفوعة، نحتاج حداً أقصى معقولاً (8 ميغا) حتى لا تمتلئ الحصة المجانية بسرعة ولا
+  // يصبح الحفظ بطيئاً. هذا يكفي لعدة دقائق من تسجيل بصيغة MP3 مضغوطة.
+  const MAX_AUDIO_MB = 8;
+  if (file.type.startsWith('audio/') && file.size > MAX_AUDIO_MB * 1024 * 1024) {
+    const isWav = /wav/i.test(file.type) || /\.wav$/i.test(file.name || '');
+    alert('⚠️ هذا الملف كبير جداً (' + (file.size/1024/1024).toFixed(1) + ' ميغابايت، الحد الأقصى ' + MAX_AUDIO_MB + ' ميغا لكل ملف صوتي).\n\n💡 الحل: ' + (isWav
+      ? 'ملفك بصيغة WAV غير مضغوطة — حوّليه إلى MP3 (يصغّر الحجم عادةً 5 إلى 10 مرات دون فقدان وضوح ملحوظ)، مثلاً عبر إعداد الحفظ في تطبيق التسجيل، أو موقع تحويل مجاني.'
+      : 'جرّبي تسجيلاً أقصر، أو صغّري جودة/معدل البت (bitrate) عند التصدير، ثم أعيدي المحاولة.') + '\n\nإذا احتجتِ فعلاً ملفات أكبر بانتظام، الحل الدائم هو ترقية مشروع Firebase إلى خطة Blaze لاستعمال Storage (راجع الشرح المرفق).');
+    input.value = '';
+    return;
   }
-  const reader = new FileReader();
-  reader.onload = e => {
-    const data = e.target.result;
-    input._dataUri = data; input._fileName = file.name; input._fileType = file.type;
-    if (!previewEl) return;
-    if (file.type.startsWith('audio/')) previewEl.innerHTML = `<audio controls style="margin-top:.4rem;width:100%;"><source src="${data}" type="${file.type}"></audio>`;
-    else previewEl.innerHTML = `<div style="padding:.5rem;background:var(--surface2);border-radius:6px;font-size:.82rem;color:var(--gold);">📄 ${file.name}</div>`;
-  };
-  reader.readAsDataURL(file);
+
+  input._file = file; input._fileName = file.name; input._fileType = file.type;
+  if (!previewEl) return;
+  const url = URL.createObjectURL(file);
+  input._previewUrl = url;
+  if (file.type.startsWith('audio/')) previewEl.innerHTML = `<audio controls style="margin-top:.4rem;width:100%;"><source src="${url}" type="${file.type}"></audio>`;
+  else previewEl.innerHTML = `<div style="padding:.5rem;background:var(--surface2);border-radius:6px;font-size:.82rem;color:var(--gold);">📄 ${file.name}</div>`;
 }
 function qbVal(id) { const el = document.getElementById(id); return el ? el.value.trim() : ''; }
 function selectAnswer(section, idx, clickedBtn) {
@@ -3810,8 +3957,12 @@ async function qbFinalDeleteSeries(examType, seriesNum) {
   if (!confirm(`حذف السيري S${sn} كاملة (${examType}) من الامتحان النهائي؟\nسيُحذف ${count} عنصر عبر CE + CO + SL.`)) return;
   for (const s of sections) {
     const bank = qbGet(s);
+    const toRemove = bank.filter(it => (it.examType || 'all') === examType && (it.seriesNum || 1) === sn);
     const newBank = bank.filter(it => !((it.examType || 'all') === examType && (it.seriesNum || 1) === sn));
-    if (newBank.length !== bank.length) await qbSave(s, newBank);
+    if (newBank.length !== bank.length) {
+      await qbSave(s, newBank);
+      toRemove.forEach(it => { if (it.filePath) window.fbDeleteFile(it.filePath); }); // تنظيف الملفات المرفقة من Storage
+    }
   }
   qbLoadAllIntoLiveBanks();
   ['ce','co','sl'].forEach(s => qbRenderList(s));
@@ -3821,9 +3972,15 @@ async function qbFinalDeleteSeries(examType, seriesNum) {
 
 async function qbAddQuestion(section) {
   const bank = qbGet(section);
-  let item = { id: Date.now(), addedAt: new Date().toLocaleDateString('fr-FR') };
   const fileInput = document.getElementById(section + '-file-upload');
-  if (fileInput && fileInput._dataUri) { item.fileUri = fileInput._dataUri; item.fileName = fileInput._fileName; item.fileType = fileInput._fileType || ''; }
+  const btn = document.querySelector(`#qbPanel-${section} .admin-btn.success`);
+  const origBtnText = btn ? btn.textContent : '';
+  const setBtnText = (t) => { if (btn) btn.textContent = t; };
+
+  let item = { id: Date.now(), addedAt: new Date().toLocaleDateString('fr-FR') };
+  // نبني دالة تفريغ الحقول لكل قسم، لكن لا نُنفّذها إلا بعد نجاح الحفظ الكامل (نصوص + ملف مرفق)
+  // — هكذا لا تُفقَد إجابات الأستاذة أبداً إذا فشل رفع الملف أو الحفظ لأي سبب.
+  let clearFields = null;
 
   if (section === 'co') {
     const text = qbVal('co-text'), q = qbVal('co-q');
@@ -3831,53 +3988,97 @@ async function qbAddQuestion(section) {
     if (!q || opts.some(o => !o)) { alert('⚠️ يرجى ملء السؤال والخيارات الأربعة'); return; }
     const seriesNum = parseInt(document.getElementById('co-seriesNum')?.value) || 1;
     item = { ...item, text, q, opts, a: parseInt(qbVal('co-answer')), level: qbVal('co-level'), examType: qbVal('co-examType'), justification: qbVal('co-justification'), seriesNum };
-    ['co-text','co-q','co-opt0','co-opt1','co-opt2','co-opt3','co-justification'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
-    const h = document.getElementById('co-answer'); if(h) h.value='0';
+    clearFields = () => {
+      ['co-text','co-q','co-opt0','co-opt1','co-opt2','co-opt3','co-justification'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+      const h = document.getElementById('co-answer'); if(h) h.value='0';
+    };
   } else if (section === 'ce') {
     const title = qbVal('ce-title'), text = qbVal('ce-text'), q = qbVal('ce-q');
     const opts = [qbVal('ce-opt0'), qbVal('ce-opt1'), qbVal('ce-opt2'), qbVal('ce-opt3')];
     if (!text || !q || opts.some(o => !o)) { alert('⚠️ يرجى ملء النص والسؤال والخيارات الأربعة'); return; }
     const ceSeriesNum = parseInt(document.getElementById('ce-seriesNum')?.value) || 1;
     item = { ...item, title, text, q, opts, a: parseInt(qbVal('ce-answer')), level: qbVal('ce-level'), examType: qbVal('ce-examType'), seriesNum: ceSeriesNum };
-    ['ce-title','ce-text','ce-q','ce-opt0','ce-opt1','ce-opt2','ce-opt3'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
-    const h = document.getElementById('ce-answer'); if(h) h.value='0';
+    clearFields = () => {
+      ['ce-title','ce-text','ce-q','ce-opt0','ce-opt1','ce-opt2','ce-opt3'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+      const h = document.getElementById('ce-answer'); if(h) h.value='0';
+    };
   } else if (section === 'sl') {
     const s = qbVal('sl-sentence'), type = qbVal('sl-type');
     const opts = [qbVal('sl-opt0'), qbVal('sl-opt1'), qbVal('sl-opt2'), qbVal('sl-opt3')];
     if (!s || opts.some(o => !o)) { alert('⚠️ يرجى ملء الجملة والخيارات الأربعة'); return; }
     const slSeriesNum = parseInt(document.getElementById('sl-seriesNum')?.value) || 1;
     item = { ...item, s, type, opts, a: parseInt(qbVal('sl-answer')), level: qbVal('sl-level'), examType: 'etudes', justification: qbVal('sl-justification'), seriesNum: slSeriesNum };
-    ['sl-sentence','sl-type','sl-opt0','sl-opt1','sl-opt2','sl-opt3','sl-justification'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
-    const h = document.getElementById('sl-answer'); if(h) h.value='0';
+    clearFields = () => {
+      ['sl-sentence','sl-type','sl-opt0','sl-opt1','sl-opt2','sl-opt3','sl-justification'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+      const h = document.getElementById('sl-answer'); if(h) h.value='0';
+    };
   } else if (section === 'ee') {
     const consigne = qbVal('ee-consigne');
     if (!consigne) { alert('⚠️ يرجى كتابة الـ Consigne'); return; }
     const eeSeriesNum = parseInt(document.getElementById('ee-seriesNum')?.value) || 1;
     item = { ...item, task: qbVal('ee-task') || 'Tâche ajoutée', consigne, ex1: qbVal('ee-ex1'), ex2: qbVal('ee-ex2'), examType: qbVal('ee-examType'), seriesNum: eeSeriesNum };
-    ['ee-consigne','ee-ex1','ee-ex2'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+    clearFields = () => { ['ee-consigne','ee-ex1','ee-ex2'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; }); };
   } else if (section === 'eo') {
     const consigne = qbVal('eo-consigne');
     if (!consigne) { alert('⚠️ يرجى كتابة الـ Consigne'); return; }
     const eoSeriesNum = parseInt(document.getElementById('eo-seriesNum')?.value) || 1;
     item = { ...item, task: qbVal('eo-task') || 'Tâche ajoutée', consigne, ex1: qbVal('eo-ex1'), ex2: qbVal('eo-ex2'), examType: qbVal('eo-examType'), seriesNum: eoSeriesNum };
-    ['eo-consigne','eo-ex1','eo-ex2'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+    clearFields = () => { ['eo-consigne','eo-ex1','eo-ex2'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; }); };
   }
-  const fp = document.getElementById(section + '-file-preview');
-  if (fp) fp.innerHTML = '';
-  if (fileInput) { fileInput.value = ''; fileInput._dataUri = null; }
+
+  // ── الملف المرفق (إن وُجد) يُضغَط ويُحوَّل إلى data URI أولاً ──
+  // يُخزَّن هذا الـ data URI (item.fileUri) كجزء من السؤال نفسه في Firebase Realtime Database
+  // (مجاني تماماً) بدل الاعتماد على Firebase Storage المدفوع — هذا يمنع مشكلة "امتلاء التخزين"
+  // في المتصفح، لكن يبقي حجم الملف نفسه محدوداً (الصور مضغوطة تلقائياً، والصوت محدود بـ 8 ميغا).
+  if (fileInput && fileInput._file) {
+    if (btn) btn.disabled = true;
+    setBtnText('⏳ جارِ معالجة الملف... 0%');
+    try {
+      const safeName = (fileInput._fileName || 'file').replace(/[^\w.\-]+/g, '_');
+      const path = `qbank/${section}/${item.id}_${safeName}`;
+      const url = await window.fbUploadFile(path, fileInput._file, (pct) => setBtnText(`⏳ جارِ معالجة الملف... ${pct}%`));
+      item.fileUri = url; item.filePath = path; item.fileName = fileInput._fileName; item.fileType = fileInput._fileType || '';
+    } catch (e) {
+      console.error('qbAddQuestion upload failed:', section, e);
+      if (btn) btn.disabled = false;
+      setBtnText(origBtnText);
+      alert('❌ فشل معالجة الملف المرفق (صوت/صورة)!\nلم تتم إضافة السؤال، لكن ما كتبتِه لم يُفقَد — أعيدي المحاولة.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e) + '\n\n💡 تأكدي أن الملف ليس تالفاً، وأعيدي المحاولة. إذا استمرت المشكلة مع ملف صوتي كبير، جرّبي ملفاً أصغر.');
+      return;
+    }
+  }
 
   try {
     bank.push(item);
+    setBtnText('⏳ جارِ الحفظ...');
     const saved = await qbSave(section, bank);
-    if (!saved) return; // qbSave already alerted بالسبب الدقيق
+    if (!saved) {
+      // فشل الحفظ في قاعدة البيانات — qbSave already alerted بالسبب. نحذف الملف المرفوع (إن وُجد)
+      // حتى لا يبقى "يتيماً" في Storage بلا سؤال يشير إليه.
+      if (item.filePath) window.fbDeleteFile(item.filePath);
+      if (btn) btn.disabled = false;
+      setBtnText(origBtnText);
+      return;
+    }
+
+    // نجح كل شيء (رفع الملف إن وُجد + الحفظ) — الآن فقط نُفرّغ النموذج
+    if (clearFields) clearFields();
+    const fp = document.getElementById(section + '-file-preview');
+    if (fp) fp.innerHTML = '';
+    if (fileInput) {
+      if (fileInput._previewUrl) { try { URL.revokeObjectURL(fileInput._previewUrl); } catch(e){} }
+      fileInput.value = '';
+      fileInput._file = null; fileInput._dataUri = null; fileInput._fileName = null; fileInput._fileType = null; fileInput._previewUrl = null;
+    }
 
     qbLoadAllIntoLiveBanks();
     qbRenderList(section);
     qbUpdateCounts();
-    const btn = document.querySelector(`#qbPanel-${section} .admin-btn.success`);
-    if (btn) { const orig = btn.textContent; btn.textContent = '✅ تمت الإضافة! يراها الطلاب الآن'; btn.style.background='var(--accent)'; setTimeout(()=>{ btn.textContent=orig; btn.style.background=''; },2000); }
+    if (btn) { btn.disabled = false; btn.textContent = '✅ تمت الإضافة! يراها الطلاب الآن'; btn.style.background='var(--accent)'; setTimeout(()=>{ btn.textContent=origBtnText; btn.style.background=''; },2000); }
   } catch (e) {
     console.error('qbAddQuestion failed:', section, e);
+    if (item.filePath) window.fbDeleteFile(item.filePath);
+    if (btn) btn.disabled = false;
+    setBtnText(origBtnText);
     alert('❌ حدث خطأ غير متوقع ولم تتم إضافة السؤال.\n\nتفصيل الخطأ: ' + (e && e.message ? e.message : e));
   }
 }
@@ -3996,17 +4197,21 @@ function qbRenderList(section) {
 async function qbDeleteItem(section, idx) {
   if (!confirm('حذف هذا السؤال؟')) return;
   const bank = qbGet(section);
+  const removed = bank[idx];
   bank.splice(idx, 1);
   await qbSave(section, bank);
+  if (removed && removed.filePath) window.fbDeleteFile(removed.filePath); // تنظيف الملف المرفق من Storage
   qbLoadAllIntoLiveBanks(); qbRenderList(section); qbUpdateCounts();
 }
 
 async function qbDeleteSeries(section, seriesNum) {
   const bank = qbGet(section);
-  const count = bank.filter(it => (it.seriesNum || 1) === seriesNum).length;
+  const toRemove = bank.filter(it => (it.seriesNum || 1) === seriesNum);
+  const count = toRemove.length;
   if (!confirm(`حذف السيري S${seriesNum} كاملة (${count} عنصر)؟`)) return;
   const newBank = bank.filter(it => (it.seriesNum || 1) !== seriesNum);
   await qbSave(section, newBank);
+  toRemove.forEach(it => { if (it.filePath) window.fbDeleteFile(it.filePath); }); // تنظيف الملفات المرفقة من Storage
   qbLoadAllIntoLiveBanks(); qbRenderList(section); qbUpdateCounts();
 }
 
@@ -4029,7 +4234,11 @@ function qbClearLocalCache() {
 }
 async function qbClearAll() {
   if (!confirm('⚠️ سيتم مسح جميع أسئلة الإدارة المضافة. هل أنت متأكد؟')) return;
-  for (const s of ['co','ce','sl','ee','eo']) await qbSave(s, []);
+  for (const s of ['co','ce','sl','ee','eo']) {
+    const filePaths = qbGet(s).filter(it => it.filePath).map(it => it.filePath);
+    await qbSave(s, []);
+    filePaths.forEach(p => window.fbDeleteFile(p)); // تنظيف كل الملفات المرفقة من Storage
+  }
   ['co','ce','sl','ee','eo'].forEach(s => qbRenderList(s));
   qbUpdateCounts(); qbLoadAllIntoLiveBanks();
   alert('✅ تم مسح جميع الأسئلة المضافة.');
