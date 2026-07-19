@@ -1934,8 +1934,10 @@ function renderExpression(section) {
   buildSeriesBtns(section + '-series-btns', es.series, (n) => {
     es.series = n; renderExpression(section);
     startTimer(cfg.minutes*60, section+'-timer');
-  });
+  }, list);
 
+  // S'assurer que es.series est dans la plage disponible (même garde-fou que renderQCM)
+  if (es.series > list.length) es.series = 1;
   const data = list[es.series-1];
   const bonusNote = cfg.bonus ? `<div style="font-size:.72rem;background:rgba(244,162,97,.12);color:var(--gold);border:1px solid rgba(244,162,97,.35);padding:.2rem .6rem;border-radius:5px;display:inline-block;margin-top:.4rem;">Entraînement supplémentaire (hors épreuves obligatoires)</div>` : '';
 
